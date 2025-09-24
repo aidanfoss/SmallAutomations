@@ -16,12 +16,14 @@ At the top of the script you can change:
 ## Usage
 ```bash
 python3 file_sync.py
+```
 
 ## To call from another script
+```python
 from file_sync import sync_files
 
 sync_files()
-
+```
 ## Requirements
 - Python 3+
 - git (atm)
