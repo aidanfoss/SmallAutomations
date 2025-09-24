@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import List, Dict, Set, Optional
 from moviepy import VideoFileClip, TextClip, CompositeVideoClip, ColorClip
 from moviepy import ImageClip
+import moviepy.video.fx as vfx
+from PIL import Image, ImageFilter
+import numpy as np
+
+
+
+
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
@@ -20,7 +27,7 @@ TIKTOK_SIZE = (1080, 1920)
 SLOTS = 5
 NUM_RENDITIONS = 10   # keep 1 when testing
 
-TEST_MODE = False      # <<< set to False for full output
+TEST_MODE = False     # <<< set to False for full output
 TEST_FRAMES = 20      # number of frames to render in test mode
 FPS = 30
 
@@ -44,6 +51,12 @@ FONT_SIZE_SUBTITLE = 72
 TOP_PANEL_OPACITY = 0.6
 EXCLUDE_COMMON = {"untagged", "chosen"}
 
+# Layout tweaks
+VIDEO_BOTTOM_OFFSET = 80   # <— lift the bottom video up by this many pixels
+FONT_SIZE_MAIN = 48        # was 55; slightly smaller to reduce overlap
+LIST_MARGIN_TOP = 170      # push list a bit lower under the subtitle
+
+
 # ============================================================
 # COMPAT / HELPERS
 # ============================================================
@@ -53,6 +66,20 @@ def _on_color(clip, size, color=None, pos=('left','center'), col_opacity=0):
     if fn:
         return fn(size=size, color=color, pos=pos, col_opacity=col_opacity)
     # fallback: just return the original if not available
+    return clip
+
+def _fl_image(clip, func):
+    """
+    Apply a per-frame transform `func(frame) -> frame` across MoviePy v1/v2.
+    Tries: fl_image (v1), image_transform (some v2 builds), then fl(...) fallback.
+    """
+    if hasattr(clip, "fl_image"):
+        return clip.fl_image(func)
+    if hasattr(clip, "image_transform"):
+        return clip.image_transform(func)
+    if hasattr(clip, "fl"):
+        return clip.fl(lambda gf, t: func(gf(t)))
+    # If nothing available, just return the clip unchanged
     return clip
 
 def _resize(clip, **kw):
@@ -91,6 +118,11 @@ def _with_margin(clip, left=6, right=6, top=3, bottom=3):
     if fn:
         return fn(left=left, right=right, top=top, bottom=bottom, color=None)
     return clip
+    
+def _subclip(clip, t0, t1):
+    fn = getattr(clip, "subclipped", None) or getattr(clip, "subclip")
+    return fn(t0, t1)
+
 
 def make_textclip(text, **kw):
     """
@@ -237,70 +269,111 @@ def save_ledger(sigs: Set[str]):
 # LAYOUT
 # ============================================================
 def resize_for_bottom_half(clip):
+    """Fill bottom half vertically, crop horizontally if needed, then lift off bottom by VIDEO_BOTTOM_OFFSET."""
     target_h = TIKTOK_SIZE[1] // 2
     c = _resize(clip, height=target_h)
     if c.w > TIKTOK_SIZE[0]:
-        x1 = (c.w - TIKTOK_SIZE[0]) // 2
-        c = _crop(c, x1=x1, y1=0, x2=x1+TIKTOK_SIZE[0], y2=c.h)
-    return _with_position(c, ("center", "bottom"))
+        x1 = int((c.w - TIKTOK_SIZE[0]) // 2)
+        c = _crop(c, x1=x1, y1=0, x2=x1 + TIKTOK_SIZE[0], y2=c.h)
+
+    # Position using explicit pixel coords (top-left origin):
+    # y = total_height - clip_height - bottom_margin
+    x = int((TIKTOK_SIZE[0] - c.w) // 2)
+    y = int(TIKTOK_SIZE[1] - c.h - VIDEO_BOTTOM_OFFSET)
+    return _with_position(c, (x, y))
+
+def make_blurred_bg(base_clip):
+    """
+    Build a full-frame, *smoothly blurred* background from base_clip:
+    - Scale & center-crop to 1080x1920 (cover-fit)
+    - Apply strong Gaussian blur using Pillow (no pixelation)
+    - Slightly darken for readability
+    """
+    # Cover-fit scale, then crop to TikTok size
+    scale = max(TIKTOK_SIZE[0] / base_clip.w, TIKTOK_SIZE[1] / base_clip.h)
+    c = _resize(base_clip, width=int(base_clip.w * scale))
+    c = _crop(
+        c,
+        width=TIKTOK_SIZE[0],
+        height=TIKTOK_SIZE[1],
+        x_center=c.w / 2,
+        y_center=c.h / 2,
+    )
+
+    # True Gaussian blur via Pillow on every frame
+    RADIUS = 28  # increase for stronger blur (e.g., 35–40)
+    def _blur_frame(frame):
+        return np.array(Image.fromarray(frame).filter(ImageFilter.GaussianBlur(radius=RADIUS)))
+
+    blurred = _fl_image(c, _blur_frame)
+
+    # Slight darken so text pops; fall back to per-frame multiply if needed
+    try:
+        blurred = blurred.fx(vfx.colorx, 0.75)
+    except Exception:
+        def _darken(frame):
+            arr = frame.astype(np.float32) * 0.75
+            return np.clip(arr, 0, 255).astype(np.uint8)
+        blurred = _fl_image(blurred, _darken)
+
+    return blurred
+
+
+
+
+from moviepy import ImageClip
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
 
 def list_panel_overlay(slots_text: List[str], start_t: float, dur: float,
                        font_path_or_none, color_rgb, panel_rgb):
     """
-    Renders the whole top-half (semi-transparent panel + numbered list)
-    with Pillow into one RGBA image, then returns it as a single ImageClip.
-    This completely sidesteps TextClip's trimming/centering issues.
+    Transparent top-half overlay that ONLY contains the numbered list text.
+    No colored panel. Renders with Pillow into one RGBA image, then to ImageClip.
     """
     overlays = []
 
     w = TIKTOK_SIZE[0]
     panel_h = TIKTOK_SIZE[1] // 2
 
-    # --- Make semi-transparent background panel ---
-    alpha = int(TOP_PANEL_OPACITY * 255)
-    img = Image.new("RGBA", (w, panel_h), (panel_rgb[0], panel_rgb[1], panel_rgb[2], alpha))
+    # Transparent canvas (no colored box)
+    img = Image.new("RGBA", (w, panel_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # --- Font load (fallback safe) ---
-    # Draw list in main size; subtitle is rendered elsewhere
+    # Load font (fallback-safe)
     try:
         if font_path_or_none:
             font_main = ImageFont.truetype(font_path_or_none, FONT_SIZE_MAIN)
         else:
-            # try a common default; if it fails Pillow falls back below
             font_main = ImageFont.truetype("arial.ttf", FONT_SIZE_MAIN)
     except Exception:
         font_main = ImageFont.load_default()
 
-    # --- Layout constants (columns + spacing) ---
-    NUM_COL_W = 90     # reserved width for "1."
-    NUM_GAP   = 16     # gap between number and title columns
+    # Columns & spacing
+    NUM_COL_W = 90   # width reserved for "1."
+    NUM_GAP   = 16   # gap between number col and title col
     x_num     = SIDE_MARGIN
     x_title   = SIDE_MARGIN + NUM_COL_W + NUM_GAP
 
-    # vertical distribution for the 5 lines (below subtitle area)
+    # Vertical distribution below the subtitle area
     space_available = panel_h - (LIST_MARGIN_TOP + 40)
     line_spacing = max(int(space_available // SLOTS), int(FONT_SIZE_MAIN * 1.35))
     line_h = int(FONT_SIZE_MAIN * 1.45)
 
-    # helpers
-    stroke_w = 2
+    stroke_w   = 2
     stroke_fill = (0, 0, 0, 255)
-    text_fill  = (color_rgb[0], color_rgb[1], color_rgb[2], 255)
+    text_fill   = (color_rgb[0], color_rgb[1], color_rgb[2], 255)
 
     def draw_text_left(x, y_center, text):
-        # draw left-anchored text with vertical centering inside a line box
         if not text:
             return
         bbox = draw.textbbox((0, 0), text, font=font_main, stroke_width=stroke_w)
-        tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
         y = int(y_center - th / 2)
         draw.text((x, y), text, font=font_main, fill=text_fill,
                   stroke_width=stroke_w, stroke_fill=stroke_fill)
 
     def draw_text_right(x_right, y_center, text):
-        # draw right-anchored number at the end of number column
         if not text:
             return
         bbox = draw.textbbox((0, 0), text, font=font_main, stroke_width=stroke_w)
@@ -311,19 +384,16 @@ def list_panel_overlay(slots_text: List[str], start_t: float, dur: float,
         draw.text((x, y), text, font=font_main, fill=text_fill,
                   stroke_width=stroke_w, stroke_fill=stroke_fill)
 
-    # --- Draw each line (number column + title column) ---
+    # Draw lines (number right-aligned in its column; title left-aligned)
     for i in range(SLOTS):
         y_center = LIST_MARGIN_TOP + i * line_spacing + line_h // 2
-        num_text = f"{i+1}."
+        num_text   = f"{i+1}."
         title_text = slots_text[i] if slots_text[i] else ""
-
-        # number right-aligned in its column
         draw_text_right(x_num + NUM_COL_W, y_center, num_text)
-        # title left-aligned in its column
-        draw_text_left(x_title, y_center, title_text)
+        draw_text_left(x_title,            y_center, title_text)
 
-    # --- Convert to MoviePy clip ---
-    arr = np.array(img)   # RGBA
+    # Convert to a timed overlay clip
+    arr = np.array(img)  # RGBA
     panel_clip = ImageClip(arr)
     panel_clip = _with_duration(panel_clip, dur)
     panel_clip = _with_position(panel_clip, ("center", "top"))
@@ -331,6 +401,7 @@ def list_panel_overlay(slots_text: List[str], start_t: float, dur: float,
 
     overlays.append(panel_clip)
     return overlays
+
 
 
 
@@ -351,25 +422,35 @@ def render_one(order_items: List[Dict], style, out_name_base: str):
     font_path = style["font_path"]
     text_rgb, panel_rgb = style["text_rgb"], style["panel_rgb"]
 
+    # Derive both the foreground (bottom-half video) and a blurred background per segment
     opened = []
+    bgs = []
     for it in order_items:
-        c = VideoFileClip(it["path"])
-        c = resize_for_bottom_half(c)
-        opened.append(c)
+        base = VideoFileClip(it["path"])
+        # foreground bottom clip
+        fg = resize_for_bottom_half(base)
+        opened.append(fg)
+        # blurred, full-frame background from same base
+        bg = make_blurred_bg(base)
+        bgs.append(bg)
 
     overlays = []
     slots_text = [""] * SLOTS
     t = 0.0
-    for i, (clip, item) in enumerate(zip(opened, order_items)):
+    for i, (fg_clip, item) in enumerate(zip(opened, order_items)):
+        # build/update list overlay for this segment
         slots_text[i] = visible_title(item["title"])
-        overlays += list_panel_overlay(slots_text, t, clip.duration, font_path, text_rgb, panel_rgb)
-        opened[i] = _with_start(clip, t)
-        t += clip.duration
+        overlays += list_panel_overlay(slots_text, t, fg_clip.duration, font_path, text_rgb, panel_rgb)
+
+        # time the fg clip + matching bg
+        opened[i] = _with_start(fg_clip, t)
+        bgs[i]    = _with_start(_with_duration(bgs[i], fg_clip.duration), t)
+
+        t += fg_clip.duration
 
     total_dur = t if not TEST_MODE else TEST_FRAMES / FPS
-    bg = ColorClip(TIKTOK_SIZE, color=(0,0,0), duration=total_dur)
 
-    # Subtitle at top-center
+    # Optional subtitle stays the same
     com = common_tag(order_items)
     subtitle_clip = None
     if com:
@@ -387,15 +468,16 @@ def render_one(order_items: List[Dict], style, out_name_base: str):
         subtitle_clip = _with_start(subtitle_clip, 0)
         subtitle_clip = _with_duration(subtitle_clip, total_dur)
 
-    layers = [bg] + opened + overlays
-    if subtitle_clip: layers.append(subtitle_clip)
+    # Compose: blurred backgrounds behind everything
+    layers = bgs + opened + overlays
+    if subtitle_clip:
+        layers.append(subtitle_clip)
 
     final = CompositeVideoClip(layers, size=TIKTOK_SIZE)
 
     out_file = OUTPUT_DIR / f"{out_name_base}.mp4"
     print(f"  -> font: {font_family} ({font_path or 'PIL default'})")
 
-    # Test mode: trim before writing
     if TEST_MODE:
         test_seconds = TEST_FRAMES / FPS
         final_short = _subclip(final, 0, test_seconds)
@@ -404,9 +486,12 @@ def render_one(order_items: List[Dict], style, out_name_base: str):
     else:
         final.write_videofile(str(out_file), fps=FPS, codec="libx264", audio_codec="aac")
 
-
-    for c in opened: c.close()
+    # Close all derivative clips
+    for c in opened + bgs:
+        try: c.close()
+        except Exception: pass
     final.close()
+
 
 # ============================================================
 # MAIN
